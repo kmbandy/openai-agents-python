@@ -11,6 +11,7 @@ from .session import (
     SessionABC,
     is_openai_responses_compaction_aware_session,
 )
+from .mneme import MnemeSession, build_memory_tools
 from .session_settings import SessionSettings
 from .util import SessionInputCallback
 
@@ -28,6 +29,8 @@ __all__ = [
     "OpenAIResponsesCompactionArgs",
     "OpenAIResponsesCompactionAwareSession",
     "is_openai_responses_compaction_aware_session",
+    "MnemeSession",
+    "build_memory_tools",
 ]
 
 
