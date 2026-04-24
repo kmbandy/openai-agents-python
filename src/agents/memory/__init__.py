@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from .mneme import (
+    FleetStore,
     MnemeRunHooks,
     MnemeSession,
     build_memory_tools,
@@ -35,6 +36,7 @@ __all__ = [
     "OpenAIResponsesCompactionArgs",
     "OpenAIResponsesCompactionAwareSession",
     "is_openai_responses_compaction_aware_session",
+    "FleetStore",
     "MnemeSession",
     "MnemeRunHooks",
     "build_memory_tools",
