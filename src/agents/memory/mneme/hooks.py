@@ -23,17 +23,46 @@ def make_memory_filter(
     agent_id: str = store.DEFAULT_AGENT,
     top_k: int = 5,
     score_threshold: float = 0.4,
+    fleet: bool = True,
 ):
     """
     Return a CallModelInputFilter that injects relevant memory into the system prompt.
 
     On every model call the filter:
       1. Extracts the last user message from the input list.
-      2. Searches Mneme for semantically related facts (top_k, score >= threshold).
-      3. Appends a <memory> block to the existing instructions string.
+      2. Searches the agent's local Mneme store for semantically related facts.
+      3. If fleet=True and MOTHERDUCK_TOKEN is set, also searches the Fleet KB on
+         MotherDuck (across all agents) and merges the two result sets by id,
+         sorted by score, capped at top_k.
+      4. Appends a <memory> block to the existing instructions string.
 
-    If no relevant facts are found, the instructions are returned unchanged.
+    Each fact is labelled with its `agent_id` in the injected block when it
+    came from a different agent than the caller, so the model can tell
+    cross-agent context apart from its own.
+
+    The FleetStore connection is created lazily and cached across the run via
+    the closure so we don't pay a fresh MotherDuck connect per LLM call. If
+    MotherDuck is unreachable, the filter falls back to local-only and tags the
+    closure so subsequent calls skip the fleet path until the next process.
     """
+    import os
+    state: dict[str, Any] = {"fleet": None, "fleet_disabled": False}
+
+    def _get_fleet():
+        if not fleet or state["fleet_disabled"]:
+            return None
+        if state["fleet"] is not None:
+            return state["fleet"]
+        if not os.environ.get("MOTHERDUCK_TOKEN", "").strip():
+            state["fleet_disabled"] = True
+            return None
+        try:
+            from .fleet import FleetStore
+            state["fleet"] = FleetStore()
+            return state["fleet"]
+        except Exception:
+            state["fleet_disabled"] = True
+            return None
 
     async def _filter(data: CallModelData[Any]) -> ModelInputData:
         from ...run_config import ModelInputData
@@ -42,17 +71,44 @@ def make_memory_filter(
         if not query:
             return data.model_data
 
-        hits = [
-            h
-            for h in store.search_facts(query, agent_id=agent_id, top_k=top_k)
-            if h["score"] >= score_threshold
-        ]
+        local_hits = store.search_facts(query, agent_id=agent_id, top_k=top_k)
+
+        fleet_hits: list[dict[str, Any]] = []
+        f = _get_fleet()
+        if f is not None:
+            try:
+                fleet_hits = f.search(query, top_k=top_k)
+            except Exception:
+                state["fleet_disabled"] = True
+                fleet_hits = []
+
+        # Merge by id, preferring whichever copy has the higher score (a fact
+        # already promoted to fleet may appear in both; keep the better one).
+        # Local hits don't include agent_id in their dict by default — inject the
+        # caller's agent_id so downstream rendering can tell self vs cross-agent.
+        merged: dict[str, dict[str, Any]] = {}
+        for h in local_hits:
+            h2 = dict(h)
+            h2.setdefault("agent_id", agent_id)
+            merged[h["id"]] = h2
+        for h in fleet_hits:
+            existing = merged.get(h["id"])
+            if existing is None or (h.get("score", 0) > existing.get("score", 0)):
+                merged[h["id"]] = h
+
+        ranked = sorted(merged.values(), key=lambda x: x.get("score", 0), reverse=True)
+        hits = [h for h in ranked if h.get("score", 0) >= score_threshold][:top_k]
         if not hits:
             return data.model_data
 
-        memory_block = "\n\n<memory>\n" + "\n".join(
-            f"[{h['type']}] {h['content']}" for h in hits
-        ) + "\n</memory>"
+        def _render(h: dict[str, Any]) -> str:
+            origin = h.get("agent_id", agent_id)
+            tag = h.get("type", "fact")
+            if origin and origin != agent_id:
+                return f"[{tag} from {origin}] {h['content']}"
+            return f"[{tag}] {h['content']}"
+
+        memory_block = "\n\n<memory>\n" + "\n".join(_render(h) for h in hits) + "\n</memory>"
 
         base = data.model_data.instructions or ""
         return ModelInputData(
