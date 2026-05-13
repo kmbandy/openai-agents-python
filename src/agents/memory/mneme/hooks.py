@@ -82,7 +82,9 @@ def _last_user_text(items: list[Any]) -> str:
 
 class MnemeRunHooks(RunHooksBase[Any]):
     """
-    RunHooks that auto-writes a session_summary fact after each agent turn.
+    RunHooks that auto-writes a session_summary fact after each agent turn,
+    then opportunistically promotes the agent's recent high-signal facts to the
+    MotherDuck FleetStore so cross-agent learning is real-time (not nightly).
 
     Pair with make_memory_filter so the summary is searchable in future turns.
     """
@@ -92,10 +94,12 @@ class MnemeRunHooks(RunHooksBase[Any]):
         agent_id: str = store.DEFAULT_AGENT,
         session_id: str = "",
         max_summary_length: int = 2000,
+        promote_to_fleet: bool = True,
     ) -> None:
         self.agent_id = agent_id
         self.session_id = session_id
         self.max_summary_length = max_summary_length
+        self.promote_to_fleet = promote_to_fleet
 
     async def on_agent_end(
         self,
@@ -113,3 +117,21 @@ class MnemeRunHooks(RunHooksBase[Any]):
             session_id=self.session_id,
             source="auto",
         )
+        # Real-time promotion to MotherDuck Fleet KB. Belt-and-braces with the
+        # nightly bonsai-agents.py catch-all. Silent-skip if MOTHERDUCK_TOKEN is
+        # not configured, fail-silent if MotherDuck is unreachable — must never
+        # break a successful agent run.
+        if not self.promote_to_fleet:
+            return
+        import os
+        if not os.environ.get("MOTHERDUCK_TOKEN", "").strip():
+            return
+        try:
+            from .fleet import FleetStore
+            fleet = FleetStore()
+            try:
+                fleet.promote_from(agent_id=self.agent_id, since_hours=1)
+            finally:
+                fleet.close()
+        except Exception:
+            return
