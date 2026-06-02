@@ -16,28 +16,57 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import logging
+import time
 
 MNEME_DIR = Path.home() / ".mneme"
-EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+EMBEDDING_MODEL = "qwen3-embedding-0.6b"
 EMBEDDING_DIM = 768
+EMBED_URL = "http://127.0.0.1:8082/v1/embeddings"
 DEFAULT_AGENT = "default"
 
-_embed_model = None
+log = logging.getLogger("mneme.store")
+
+# DuckDB lock errors (single-writer per file). Version-robust tuple.
+_DB_LOCK_ERRORS = (getattr(duckdb, "IOException", getattr(duckdb, "Error", Exception)),)
 
 
-def _get_embed_model():
-    global _embed_model
-    if _embed_model is None:
-        from sentence_transformers import SentenceTransformer
+def _with_retry(fn, *, exceptions, label, tries=4, base=0.25):
+    """Run fn(), retrying transient failures with exponential backoff.
 
-        _embed_model = SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True, device="cpu")
-    return _embed_model
+    The embed server can briefly queue (batch syncs) and DuckDB is single-writer
+    per file, so a connect can collide with a concurrent sync/aging job. Retrying
+    lets these self-heal instead of surfacing as a hard timeout to the caller.
+    Re-raises the real error if the service is genuinely down (never hangs).
+    """
+    last_exc = None
+    for attempt in range(tries):
+        try:
+            return fn()
+        except exceptions as exc:
+            last_exc = exc
+            if attempt == tries - 1:
+                break
+            log.warning(
+                "mneme %s failed (attempt %d/%d): %s", label, attempt + 1, tries, exc
+            )
+            time.sleep(base * (2 ** attempt))
+    raise last_exc
 
 
 def _embed(text: str) -> list[float]:
-    model = _get_embed_model()
-    vec = model.encode([text], normalize_embeddings=True)[0]
-    return vec.tolist()
+    import httpx, math
+
+    def _call() -> list[float]:
+        resp = httpx.post(
+            EMBED_URL, json={"input": text, "encoding_format": "float"}, timeout=30.0
+        )
+        resp.raise_for_status()
+        return resp.json()["data"][0]["embedding"][:EMBEDDING_DIM]
+
+    vec = _with_retry(_call, exceptions=(httpx.HTTPError,), label="embed")
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / norm for x in vec]
 
 
 def _db_path(agent_id: str) -> Path:
@@ -46,9 +75,16 @@ def _db_path(agent_id: str) -> Path:
 
 
 def _get_conn(agent_id: str = DEFAULT_AGENT) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(_db_path(agent_id)))
-    _ensure_schema(conn)
-    return conn
+    # connect raises duckdb.IOException when another process holds the
+    # single-writer lock; be patient (lock windows can be a few seconds).
+    def _connect() -> duckdb.DuckDBPyConnection:
+        conn = duckdb.connect(str(_db_path(agent_id)))
+        _ensure_schema(conn)
+        return conn
+
+    return _with_retry(
+        _connect, exceptions=_DB_LOCK_ERRORS, label="duckdb connect", tries=6, base=0.3
+    )
 
 
 def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
